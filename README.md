@@ -45,7 +45,7 @@ User Query (Slovak)
 | Generator       | Ollama `qwen2.5:7b-instruct`            |
 | Backend         | FastAPI                                  |
 | Frontend        | Streamlit                                |
-| Dataset         | SK-QuAD (`TUKE-KEMT/SK-QuAD`)           |
+| Dataset         | SK-QuAD corpus (`TUKE-KEMT/retrieval-skquad`)  |
 
 ---
 
@@ -78,11 +78,15 @@ pip install -r requirements.txt
 ### 4. Ingest SK-QuAD into Qdrant
 
 ```bash
-python scripts/ingest.py
+python scripts/ingest.py --batch-size 8 --num-threads 8
 ```
 
-Downloads SK-QuAD from HuggingFace, encodes ~22k paragraphs with BGE-M3,
+Downloads corpus from `TUKE-KEMT/retrieval-skquad`, encodes ~70k documents with BGE-M3,
 and upserts to Qdrant. This is the slow step (~45-90 min on CPU, ~5-10 min on GPU).
+
+CPU note: `ingest.py` now defaults to fp32 (better for most CPU-only systems). Enable fp16 only when using GPU by adding `--fp16`.
+
+If ingestion is interrupted, re-running `ingest.py` resumes from the current Qdrant count.
 
 Progress is shown with a tqdm bar. Safe to re-run — skips if collection already populated.
 

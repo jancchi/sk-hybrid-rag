@@ -11,6 +11,9 @@ The system prompt explicitly instructs the model to:
 """
 
 import logging
+import json
+import re
+from collections.abc import AsyncIterator
 
 import httpx
 
@@ -18,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 MODEL_NAME = "qwen2.5:7b-instruct"
+OLLAMA_TIMEOUT_SECONDS = 540.0
+
+_ollama_client: httpx.AsyncClient | None = None
 
 SYSTEM_PROMPT = """Si odborný právno-finančný asistent pre slovenské právo a dane. \
 Odpovedaj vždy v slovenčine. \
@@ -31,10 +37,94 @@ Nedomýšľaj si ani nedoplňuj informácie mimo poskytnutého kontextu."""
 def build_user_message(question: str, contexts: list[dict]) -> str:
     """Format context passages + question into a single user turn."""
     context_block = "\n\n".join(
-        f"[{i + 1}] Zdroj: {c['title']}\n{c['context']}"
-        for i, c in enumerate(contexts)
+        f"[{i + 1}] Zdroj: {c['title']}\n{c['context']}" for i, c in enumerate(contexts)
     )
     return f"ZDROJE:\n{context_block}\n\nOTÁZKA: {question}"
+
+
+def set_ollama_client(client: httpx.AsyncClient | None) -> None:
+    """Inject a shared AsyncClient managed by app lifespan."""
+    global _ollama_client
+    _ollama_client = client
+
+
+def _build_payload(question: str, contexts: list[dict], stream: bool) -> dict:
+    return {
+        "model": MODEL_NAME,
+        "stream": stream,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_message(question, contexts)},
+        ],
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 512,
+        },
+    }
+
+
+def _raise_ollama_runtime_error(e: Exception) -> RuntimeError:
+    if isinstance(e, httpx.TimeoutException):
+        logger.error(f"Ollama timeout after {OLLAMA_TIMEOUT_SECONDS:.0f} seconds: {e}")
+        return RuntimeError(
+            "Ollama is taking too long to generate a response "
+            f"(timeout after {OLLAMA_TIMEOUT_SECONDS:.0f} seconds). "
+            "The model may be overloaded or running slowly. Please try again."
+        )
+    if isinstance(e, httpx.ConnectError):
+        logger.error(f"Cannot reach Ollama. Is it running? {e}")
+        return RuntimeError(
+            "Ollama is not reachable at localhost:11434. "
+            "Run: docker compose up -d && docker exec sk_ollama ollama pull qwen2.5:7b-instruct"
+        )
+    if isinstance(e, httpx.HTTPStatusError):
+        logger.error(f"Ollama HTTP error: {e}")
+        return RuntimeError("Ollama returned an HTTP error while generating an answer.")
+    if isinstance(e, (KeyError, TypeError, ValueError)):
+        logger.error(f"Unexpected Ollama response payload: {e}")
+        return RuntimeError("Ollama returned an invalid response payload.")
+    logger.error(f"Unexpected Ollama error: {e}")
+    return RuntimeError("Unexpected Ollama error while generating an answer.")
+
+
+def _get_client() -> tuple[httpx.AsyncClient, bool]:
+    client = _ollama_client
+    if client is not None:
+        return client, False
+    return httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SECONDS), True
+
+
+def _iter_token_chunks(text: str) -> list[str]:
+    """Split text into small token-like chunks while preserving spacing."""
+    return re.findall(r"\S+|\s+", text)
+
+
+async def stream_answer(question: str, contexts: list[dict]) -> AsyncIterator[str]:
+    """Stream token chunks from Ollama /api/chat."""
+    payload = _build_payload(question=question, contexts=contexts, stream=True)
+    client, owns_client = _get_client()
+
+    try:
+        async with client.stream(
+            "POST", f"{OLLAMA_BASE_URL}/api/chat", json=payload
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                message = chunk.get("message") or {}
+                content = message.get("content", "")
+                if content:
+                    for token_chunk in _iter_token_chunks(content):
+                        yield token_chunk
+                if chunk.get("done"):
+                    break
+    except Exception as e:
+        raise _raise_ollama_runtime_error(e) from e
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 async def generate_answer(question: str, contexts: list[dict]) -> str:
@@ -51,33 +141,16 @@ async def generate_answer(question: str, contexts: list[dict]) -> str:
     -------
     str — the model's answer in Slovak
     """
-    payload = {
-        "model": MODEL_NAME,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_message(question, contexts)},
-        ],
-        "options": {
-            "temperature": 0.1,   # Low temp for factual legal answers
-            "num_predict": 512,
-        },
-    }
+    payload = _build_payload(question=question, contexts=contexts, stream=False)
+    client, owns_client = _get_client()
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                f"{OLLAMA_BASE_URL}/api/chat", json=payload
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data["message"]["content"].strip()
-    except httpx.ConnectError:
-        logger.error("Cannot reach Ollama. Is it running? `docker compose up -d`")
-        raise RuntimeError(
-            "Ollama is not reachable at localhost:11434. "
-            "Run: docker compose up -d && docker exec sk_ollama ollama pull qwen2.5:7b-instruct"
-        )
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Ollama HTTP error: {e}")
-        raise
+        response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data["message"]["content"].strip()
+    except Exception as e:
+        raise _raise_ollama_runtime_error(e) from e
+    finally:
+        if owns_client:
+            await client.aclose()
